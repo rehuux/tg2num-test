@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException, Response
 from huggingface_hub import HfFileSystem
 from pydantic import BaseModel
 
-# ── Config ──────────────────────────────────────────────────────────────────
+# --- Config ---
 BUCKET_PARQUET = os.environ.get(
     "TC_BUCKET_PARQUET",
     "hf://buckets/rehuuuu/TELEGRAM-COUNTRY-bucket/simple_all/simple_all.parquet",
@@ -25,7 +25,7 @@ CREDIT_INFO = {
     "channel": "@RehuSzr",
 }
 
-# ── DuckDB Connection Pool ──────────────────────────────────────────────────
+# --- DuckDB Connection Pool ---
 _conns: list[duckdb.DuckDBPyConnection] = []
 _conns_lock = threading.Lock()
 _thread_local = threading.local()
@@ -63,8 +63,8 @@ def _get_conn() -> duckdb.DuckDBPyConnection:
     return _conns[ident]
 
 
-# ── Core Lookup ─────────────────────────────────────────────────────────────
-def _lookup_user(user_id: str) -> dict | None:
+# --- Core Lookup ---
+def _lookup_user(user_id: str):
     """Fetch a single user by user_id."""
     uid = str(user_id).strip().replace("'", "''")
     sql = f"""
@@ -81,7 +81,7 @@ def _lookup_user(user_id: str) -> dict | None:
     return dict(zip(cols, row))
 
 
-# ── FastAPI ─────────────────────────────────────────────────────────────────
+# --- FastAPI ---
 fastapi_app = FastAPI(title="Telegram Country API")
 
 
@@ -106,7 +106,7 @@ def health():
 
 @fastapi_app.get("/user/{user_id}")
 async def get_user(user_id: str):
-    """Primary endpoint — user_id → phone, username, country_info."""
+    """Primary endpoint - user_id to phone, username, country_info."""
     loop = asyncio.get_running_loop()
     data = await loop.run_in_executor(pool, _lookup_user, user_id)
 
@@ -129,7 +129,7 @@ async def get_user(user_id: str):
 
 @fastapi_app.post("/users/batch")
 async def get_users_batch(req: BatchRequest):
-    """Batch lookup — up to 100 user_ids."""
+    """Batch lookup - up to 100 user_ids."""
     if not req.user_ids:
         raise HTTPException(400, "user_ids must not be empty")
     if len(req.user_ids) > 100:
@@ -160,7 +160,7 @@ async def get_users_batch(req: BatchRequest):
     }
 
 
-# ── Pinger (Render free tier keep-alive) ────────────────────────────────────
+# --- Pinger (Render free tier keep-alive) ---
 async def pinger():
     port = os.getenv("PORT", "7860")
     url = f"http://localhost:{port}/health"
@@ -179,29 +179,29 @@ async def startup_event():
     asyncio.create_task(pinger())
 
 
-# ── Gradio UI ───────────────────────────────────────────────────────────────
+# --- Gradio UI ---
 def ui_lookup(user_id: str) -> str:
     if not user_id or not user_id.strip():
-        return "⚠️ User ID daalo."
+        return "User ID daalo."
 
     try:
         data = _lookup_user(user_id.strip())
     except Exception as e:
-        return f"❌ Error: `{e}`"
+        return f"Error: {e}"
 
     if data is None:
         return (
-            f"🔍 **User ID:** `{user_id}`\n\n"
-            f"❌ **Not found.**\n\n---\n\n"
-            f"👨‍💻 **Developer:** rehuu | 📢 **Channel:** @RehuSzr"
+            f"User ID: {user_id}\n\n"
+            f"Not found.\n\n---\n\n"
+            f"Developer: rehuu | Channel: @RehuSzr"
         )
 
     return (
-        f"🔍 **User ID:** `{data['user_id']}`\n\n"
-        f"- 📞 **phone:** `{data['phone']}`\n"
-        f"- 👤 **username:** `{data['username']}`\n"
-        f"- 🌍 **country_info:** `{data['country_info']}`\n\n"
-        f"---\n\n👨‍💻 **Developer:** rehuu | 📢 **Channel:** @RehuSzr"
+        f"User ID: {data['user_id']}\n\n"
+        f"- phone: {data['phone']}\n"
+        f"- username: {data['username']}\n"
+        f"- country_info: {data['country_info']}\n\n"
+        f"---\n\nDeveloper: rehuu | Channel: @RehuSzr"
     )
 
 
@@ -209,14 +209,9 @@ def build_ui():
     with gr.Blocks(
         title="Telegram Country API",
         theme=gr.themes.Soft(),
-        css="""
-        .main-title { text-align: center; margin-bottom: 0; }
-        .subtitle { text-align: center; color: #666; margin-top: 0; }
-        .footer { text-align: center; color: #888; margin-top: 20px; }
-        """,
     ) as demo:
-        gr.Markdown("# 🔍 Telegram Country API", elem_classes="main-title")
-        gr.Markdown("User ID daalo — phone, username, country milega", elem_classes="subtitle")
+        gr.Markdown("# Telegram Country API")
+        gr.Markdown("User ID daalo - phone, username, country milega")
 
         with gr.Row():
             uid_input = gr.Textbox(
@@ -225,7 +220,7 @@ def build_ui():
                 lines=1,
                 scale=3,
             )
-            btn = gr.Button("🔍 Lookup", variant="primary", scale=1)
+            btn = gr.Button("Lookup", variant="primary", scale=1)
 
         output = gr.Markdown(label="Result")
 
@@ -233,25 +228,25 @@ def build_ui():
         uid_input.submit(fn=ui_lookup, inputs=uid_input, outputs=output)
 
         gr.Markdown("---")
-        with gr.Accordion("📡 API Info", open=False):
-            gr.Markdown("""
-**Endpoints:**
-- `GET /user/{user_id}` — Single lookup
-- `POST /users/batch` — Batch (max 100)
-- `GET /health` — Health check
-- `GET /docs` — Swagger UI
+        with gr.Accordion("API Info", open=False):
+            gr.Markdown(
+                "**Endpoints:**\n"
+                "- `GET /user/{user_id}` - Single lookup\n"
+                "- `POST /users/batch` - Batch (max 100)\n"
+                "- `GET /health` - Health check\n"
+                "- `GET /docs` - Swagger UI\n\n"
+                "**Example:**\n"
+                "```bash\n"
+                "curl https://your-app.onrender.com/user/723625545\n"
+                "```\n\n"
+                "Developer: rehuu | Channel: @RehuSzr"
+            )
 
-**Example:**
-```bash
-curl https://your-app.onrender.com/user/723625545
-```
+        gr.Markdown("---\nDeveloper: rehuu | Channel: @RehuSzr")
 
-Source: HF Bucket
+    return demo
 
-👨‍💻 Developer: rehuu | 📢 Channel: @RehuSzr
-""")
 
-── Mount Gradio on FastAPI ─────────────────────────────────────────────────
-
+# --- Mount Gradio on FastAPI ---
 demo = build_ui()
 app = gr.mount_gradio_app(fastapi_app, demo, path="/")
