@@ -14,7 +14,7 @@ from pydantic import BaseModel
 # --- Config ---
 BUCKET_URL = (
     "https://huggingface.co/buckets/rehuuuu/TELEGRAM-COUNTRY-bucket"
-    "/resolve/main/simple_all/simple_all.parquet"
+    "/resolve/simple_all/simple_all.parquet"
 )
 LOCAL_PATH = "/tmp/simple_all.parquet"
 
