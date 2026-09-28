@@ -9,12 +9,13 @@ import duckdb
 import gradio as gr
 import httpx
 from fastapi import FastAPI, HTTPException, Response
-from huggingface_hub import hf_hub_download
 from pydantic import BaseModel
 
 # --- Config ---
-REPO_ID = "rehuuuu/TELEGRAM-COUNTRY-bucket"
-FILENAME = "simple_all/simple_all.parquet"
+BUCKET_URL = (
+    "https://huggingface.co/buckets/rehuuuu/TELEGRAM-COUNTRY-bucket"
+    "/resolve/main/simple_all/simple_all.parquet"
+)
 LOCAL_PATH = "/tmp/simple_all.parquet"
 
 PARALLELISM = int(os.environ.get("TC_PARALLEL", "2"))
@@ -27,6 +28,7 @@ _conns_lock = threading.Lock()
 _thread_local = threading.local()
 pool = ThreadPoolExecutor(max_workers=PARALLELISM, thread_name_prefix="duck")
 _downloaded = False
+_download_lock = threading.Lock()
 
 
 def _ensure_downloaded():
@@ -34,21 +36,32 @@ def _ensure_downloaded():
     global _downloaded
     if _downloaded and os.path.exists(LOCAL_PATH):
         return
-    print("[DB] Downloading parquet from HF Bucket...", flush=True)
-    token = os.getenv("HF_TOKEN")
-    path = hf_hub_download(
-        repo_id=REPO_ID,
-        filename=FILENAME,
-        repo_type="bucket",
-        local_dir="/tmp",
-        token=token,
-    )
-    # hf_hub_download returns path; move to fixed location if needed
-    if path != LOCAL_PATH and os.path.exists(path):
-        os.replace(path, LOCAL_PATH)
-    size_mb = os.path.getsize(LOCAL_PATH) / (1024 * 1024)
-    print(f"[DB] Downloaded: {size_mb:.1f} MB", flush=True)
-    _downloaded = True
+    with _download_lock:
+        if _downloaded and os.path.exists(LOCAL_PATH):
+            return
+        print("[DB] Downloading parquet from HF Bucket...", flush=True)
+        token = os.getenv("HF_TOKEN")
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        try:
+            with httpx.stream(
+                "GET",
+                BUCKET_URL,
+                headers=headers,
+                follow_redirects=True,
+                timeout=httpx.Timeout(600.0, connect=30.0),
+            ) as r:
+                r.raise_for_status()
+                with open(LOCAL_PATH, "wb") as f:
+                    for chunk in r.iter_bytes(chunk_size=1024 * 1024):
+                        f.write(chunk)
+        except Exception as e:
+            print(f"[DB] Download failed: {e}", flush=True)
+            if os.path.exists(LOCAL_PATH):
+                os.remove(LOCAL_PATH)
+            raise
+        size_mb = os.path.getsize(LOCAL_PATH) / (1024 * 1024)
+        print(f"[DB] Downloaded: {size_mb:.1f} MB", flush=True)
+        _downloaded = True
 
 
 def _new_conn():
@@ -58,7 +71,9 @@ def _new_conn():
     con.execute("SET home_directory='/tmp'")
     con.execute("SET extension_directory='/tmp/duckdb_extensions'")
     con.execute(f"SET threads = {THREADS_PER_CONN}")
-    cnt = con.execute(f"SELECT COUNT(*) FROM read_parquet('{LOCAL_PATH}')").fetchone()[0]
+    cnt = con.execute(
+        f"SELECT COUNT(*) FROM read_parquet('{LOCAL_PATH}')"
+    ).fetchone()[0]
     print(f"[DB] Ready. Rows: {cnt}", flush=True)
     return con
 
@@ -106,22 +121,38 @@ class BatchRequest(BaseModel):
 
 @fastapi_app.get("/")
 def root():
-    return {"app": "Telegram Country API", "usage": "GET /user/{user_id}", "credit": CREDIT_INFO}
+    return {
+        "app": "Telegram Country API",
+        "usage": "GET /user/{user_id}",
+        "credit": CREDIT_INFO,
+    }
 
 
 @fastapi_app.get("/health")
 def health():
-    return {"status": "ok", "downloaded": _downloaded, "credit": CREDIT_INFO}
+    return {
+        "status": "ok",
+        "downloaded": _downloaded,
+        "file_exists": os.path.exists(LOCAL_PATH),
+        "credit": CREDIT_INFO,
+    }
 
 
 @fastapi_app.get("/debug")
 def debug():
     try:
         con = _get_conn()
-        cnt = con.execute(f"SELECT COUNT(*) FROM read_parquet('{LOCAL_PATH}')").fetchone()[0]
+        cnt = con.execute(
+            f"SELECT COUNT(*) FROM read_parquet('{LOCAL_PATH}')"
+        ).fetchone()[0]
         return {"ok": True, "total_rows": cnt, "credit": CREDIT_INFO}
     except Exception as e:
-        return {"ok": False, "error": str(e), "traceback": traceback.format_exc()}
+        return {
+            "ok": False,
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+            "credit": CREDIT_INFO,
+        }
 
 
 @fastapi_app.get("/user/{user_id}")
@@ -134,11 +165,11 @@ async def get_user(user_id: str):
     if data is None:
         raise HTTPException(404, f"User ID '{user_id}' not found")
     return Response(
-        content=json.dumps({
-            "success": True,
-            **data,
-            "credit": CREDIT_INFO,
-        }, indent=2, ensure_ascii=False),
+        content=json.dumps(
+            {"success": True, **data, "credit": CREDIT_INFO},
+            indent=2,
+            ensure_ascii=False,
+        ),
         media_type="application/json",
     )
 
@@ -184,7 +215,6 @@ async def pinger():
 @fastapi_app.on_event("startup")
 async def startup_event():
     asyncio.create_task(pinger())
-    # Pre-download in background so first request is fast
     loop = asyncio.get_running_loop()
     loop.run_in_executor(pool, _ensure_downloaded)
 
