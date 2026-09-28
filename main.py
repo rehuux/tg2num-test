@@ -2,51 +2,68 @@ import asyncio
 import json
 import os
 import threading
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 
 import duckdb
 import gradio as gr
 import httpx
 from fastapi import FastAPI, HTTPException, Response
-from huggingface_hub import HfFileSystem
+from huggingface_hub import hf_hub_download
 from pydantic import BaseModel
 
 # --- Config ---
-BUCKET_PARQUET = os.environ.get(
-    "TC_BUCKET_PARQUET",
-    "hf://buckets/rehuuuu/TELEGRAM-COUNTRY-bucket/simple_all/simple_all.parquet",
-)
+REPO_ID = "rehuuuu/TELEGRAM-COUNTRY-bucket"
+FILENAME = "simple_all/simple_all.parquet"
+LOCAL_PATH = "/tmp/simple_all.parquet"
 
 PARALLELISM = int(os.environ.get("TC_PARALLEL", "2"))
 THREADS_PER_CONN = int(os.environ.get("TC_THREADS_PER_CONN", "2"))
 
-CREDIT_INFO = {
-    "developer": "rehuu",
-    "channel": "@RehuSzr",
-}
+CREDIT_INFO = {"developer": "rehuu", "channel": "@RehuSzr"}
 
-# --- DuckDB Connection Pool ---
-_conns: list[duckdb.DuckDBPyConnection] = []
+_conns = []
 _conns_lock = threading.Lock()
 _thread_local = threading.local()
 pool = ThreadPoolExecutor(max_workers=PARALLELISM, thread_name_prefix="duck")
+_downloaded = False
 
 
-def _new_conn() -> duckdb.DuckDBPyConnection:
+def _ensure_downloaded():
+    """Download parquet from HF Bucket to /tmp once."""
+    global _downloaded
+    if _downloaded and os.path.exists(LOCAL_PATH):
+        return
+    print("[DB] Downloading parquet from HF Bucket...", flush=True)
+    token = os.getenv("HF_TOKEN")
+    path = hf_hub_download(
+        repo_id=REPO_ID,
+        filename=FILENAME,
+        repo_type="bucket",
+        local_dir="/tmp",
+        token=token,
+    )
+    # hf_hub_download returns path; move to fixed location if needed
+    if path != LOCAL_PATH and os.path.exists(path):
+        os.replace(path, LOCAL_PATH)
+    size_mb = os.path.getsize(LOCAL_PATH) / (1024 * 1024)
+    print(f"[DB] Downloaded: {size_mb:.1f} MB", flush=True)
+    _downloaded = True
+
+
+def _new_conn():
+    print("[DB] Creating DuckDB connection...", flush=True)
+    _ensure_downloaded()
     con = duckdb.connect()
     con.execute("SET home_directory='/tmp'")
     con.execute("SET extension_directory='/tmp/duckdb_extensions'")
-    con.execute("INSTALL httpfs; LOAD httpfs;")
-
-    # Register HF filesystem so DuckDB can read hf://buckets/
-    hffs = HfFileSystem(token=os.getenv("HF_TOKEN"))
-    duckdb.register_filesystem(hffs)
-
     con.execute(f"SET threads = {THREADS_PER_CONN}")
+    cnt = con.execute(f"SELECT COUNT(*) FROM read_parquet('{LOCAL_PATH}')").fetchone()[0]
+    print(f"[DB] Ready. Rows: {cnt}", flush=True)
     return con
 
 
-def _thread_id() -> int:
+def _thread_id():
     tid = getattr(_thread_local, "id", None)
     if tid is None:
         with _conns_lock:
@@ -55,7 +72,7 @@ def _thread_id() -> int:
     return tid
 
 
-def _get_conn() -> duckdb.DuckDBPyConnection:
+def _get_conn():
     ident = _thread_id()
     with _conns_lock:
         while len(_conns) <= ident:
@@ -63,13 +80,11 @@ def _get_conn() -> duckdb.DuckDBPyConnection:
     return _conns[ident]
 
 
-# --- Core Lookup ---
 def _lookup_user(user_id: str):
-    """Fetch a single user by user_id."""
     uid = str(user_id).strip().replace("'", "''")
     sql = f"""
         SELECT user_id, phone, username, country_info
-        FROM read_parquet('{BUCKET_PARQUET}')
+        FROM read_parquet('{LOCAL_PATH}')
         WHERE user_id = '{uid}'
         LIMIT 1
     """
@@ -77,7 +92,7 @@ def _lookup_user(user_id: str):
     row = con.execute(sql).fetchone()
     if row is None:
         return None
-    cols = [d[0] for d in con.description]
+    cols = ["user_id", "phone", "username", "country_info"]
     return dict(zip(cols, row))
 
 
@@ -91,67 +106,60 @@ class BatchRequest(BaseModel):
 
 @fastapi_app.get("/")
 def root():
-    return {
-        "app": "Telegram Country API",
-        "source": "hf://buckets/rehuuuu/TELEGRAM-COUNTRY-bucket",
-        "usage": "GET /user/{user_id}",
-        "developer": "rehuu | channel @RehuSzr",
-    }
+    return {"app": "Telegram Country API", "usage": "GET /user/{user_id}", "credit": CREDIT_INFO}
 
 
 @fastapi_app.get("/health")
 def health():
-    return {"status": "ok", "credit": CREDIT_INFO}
+    return {"status": "ok", "downloaded": _downloaded, "credit": CREDIT_INFO}
+
+
+@fastapi_app.get("/debug")
+def debug():
+    try:
+        con = _get_conn()
+        cnt = con.execute(f"SELECT COUNT(*) FROM read_parquet('{LOCAL_PATH}')").fetchone()[0]
+        return {"ok": True, "total_rows": cnt, "credit": CREDIT_INFO}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "traceback": traceback.format_exc()}
 
 
 @fastapi_app.get("/user/{user_id}")
 async def get_user(user_id: str):
-    """Primary endpoint - user_id to phone, username, country_info."""
     loop = asyncio.get_running_loop()
-    data = await loop.run_in_executor(pool, _lookup_user, user_id)
-
+    try:
+        data = await loop.run_in_executor(pool, _lookup_user, user_id)
+    except Exception as e:
+        raise HTTPException(500, f"Query failed: {e}")
     if data is None:
-        raise HTTPException(status_code=404, detail=f"User ID '{user_id}' not found")
-
-    result = {
-        "success": True,
-        "user_id": data["user_id"],
-        "phone": data["phone"],
-        "username": data["username"],
-        "country_info": data["country_info"],
-        "credit": CREDIT_INFO,
-    }
+        raise HTTPException(404, f"User ID '{user_id}' not found")
     return Response(
-        content=json.dumps(result, indent=2, ensure_ascii=False),
+        content=json.dumps({
+            "success": True,
+            **data,
+            "credit": CREDIT_INFO,
+        }, indent=2, ensure_ascii=False),
         media_type="application/json",
     )
 
 
 @fastapi_app.post("/users/batch")
 async def get_users_batch(req: BatchRequest):
-    """Batch lookup - up to 100 user_ids."""
     if not req.user_ids:
-        raise HTTPException(400, "user_ids must not be empty")
+        raise HTTPException(400, "user_ids empty")
     if len(req.user_ids) > 100:
-        raise HTTPException(400, "max 100 user_ids per batch")
-
+        raise HTTPException(400, "max 100")
     loop = asyncio.get_running_loop()
     tasks = [loop.run_in_executor(pool, _lookup_user, uid) for uid in req.user_ids]
-    rows = await asyncio.gather(*tasks)
-
+    rows = await asyncio.gather(*tasks, return_exceptions=True)
     results = []
     for uid, data in zip(req.user_ids, rows):
-        if data is None:
+        if isinstance(data, Exception):
+            results.append({"user_id": uid, "found": False, "error": str(data)})
+        elif data is None:
             results.append({"user_id": uid, "found": False})
         else:
-            results.append({
-                "user_id": data["user_id"],
-                "found": True,
-                "phone": data["phone"],
-                "username": data["username"],
-                "country_info": data["country_info"],
-            })
-
+            results.append({"user_id": data["user_id"], "found": True, **data})
     return {
         "total": len(req.user_ids),
         "found": sum(1 for r in results if r["found"]),
@@ -160,7 +168,6 @@ async def get_users_batch(req: BatchRequest):
     }
 
 
-# --- Pinger (Render free tier keep-alive) ---
 async def pinger():
     port = os.getenv("PORT", "7860")
     url = f"http://localhost:{port}/health"
@@ -169,84 +176,48 @@ async def pinger():
             await asyncio.sleep(120)
             try:
                 r = await client.get(url)
-                print(f"[Pinger] {r.status_code}")
+                print(f"[Pinger] {r.status_code}", flush=True)
             except Exception as e:
-                print(f"[Pinger] {e}")
+                print(f"[Pinger] {e}", flush=True)
 
 
 @fastapi_app.on_event("startup")
 async def startup_event():
     asyncio.create_task(pinger())
+    # Pre-download in background so first request is fast
+    loop = asyncio.get_running_loop()
+    loop.run_in_executor(pool, _ensure_downloaded)
 
 
 # --- Gradio UI ---
 def ui_lookup(user_id: str) -> str:
     if not user_id or not user_id.strip():
         return "User ID daalo."
-
     try:
         data = _lookup_user(user_id.strip())
     except Exception as e:
         return f"Error: {e}"
-
     if data is None:
-        return (
-            f"User ID: {user_id}\n\n"
-            f"Not found.\n\n---\n\n"
-            f"Developer: rehuu | Channel: @RehuSzr"
-        )
-
+        return f"User ID: {user_id}\n\nNot found."
     return (
         f"User ID: {data['user_id']}\n\n"
         f"- phone: {data['phone']}\n"
         f"- username: {data['username']}\n"
-        f"- country_info: {data['country_info']}\n\n"
-        f"---\n\nDeveloper: rehuu | Channel: @RehuSzr"
+        f"- country_info: {data['country_info']}"
     )
 
 
 def build_ui():
-    with gr.Blocks(
-        title="Telegram Country API",
-        theme=gr.themes.Soft(),
-    ) as demo:
+    with gr.Blocks(title="Telegram Country API", theme=gr.themes.Soft()) as demo:
         gr.Markdown("# Telegram Country API")
-        gr.Markdown("User ID daalo - phone, username, country milega")
-
         with gr.Row():
-            uid_input = gr.Textbox(
-                label="User ID",
-                placeholder="e.g. 723625545",
-                lines=1,
-                scale=3,
-            )
+            uid_input = gr.Textbox(label="User ID", placeholder="723625545", scale=3)
             btn = gr.Button("Lookup", variant="primary", scale=1)
-
-        output = gr.Markdown(label="Result")
-
+        output = gr.Markdown()
         btn.click(fn=ui_lookup, inputs=uid_input, outputs=output)
         uid_input.submit(fn=ui_lookup, inputs=uid_input, outputs=output)
-
-        gr.Markdown("---")
-        with gr.Accordion("API Info", open=False):
-            gr.Markdown(
-                "**Endpoints:**\n"
-                "- `GET /user/{user_id}` - Single lookup\n"
-                "- `POST /users/batch` - Batch (max 100)\n"
-                "- `GET /health` - Health check\n"
-                "- `GET /docs` - Swagger UI\n\n"
-                "**Example:**\n"
-                "```bash\n"
-                "curl https://your-app.onrender.com/user/723625545\n"
-                "```\n\n"
-                "Developer: rehuu | Channel: @RehuSzr"
-            )
-
-        gr.Markdown("---\nDeveloper: rehuu | Channel: @RehuSzr")
-
     return demo
 
 
-# --- Mount Gradio on FastAPI ---
 demo = build_ui()
-app = gr.mount_gradio_app(fastapi_app, demo, path="/")
+app = gr.mount_gradio_app(fastapi_app, demo, path="/ui")
